@@ -2,61 +2,71 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import tqdm
-import time
-from sklearn.metrics import confusion_matrix
-from sklearn.metrics import f1_score
+import math
+# from sklearn.metrics import confusion_matrix
+# from sklearn.metrics import f1_score
 import random
 from torch.utils import data
 import argparse
-import os, shutil
-from ResNet_model import ResNet
+import os
+from models.ResNet_model import ResNet
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 import argparse
 
-torch.set_default_tensor_type(torch.FloatTensor)
-device = torch.device('cuda')
+# torch.set_default_tensor_type(torch.FloatTensor)
+device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+print("Using device: ", device)
+is_ok = device.type!='mps'
 
 #Data augmentation function
 def Meiosis(signal, Q, rand_subs_stre, split):
     num_subs = signal.shape[0]
-    signal_len = signal.shape[-2]
+    half = math.floor(num_subs/2)
+    # signal_len = signal.shape[-2]
     new_signal = []
     new_signal1 = []
     new_signal2 = []
-    for i in range(0, 22):  ###
+    for i in range(half):  ### 21 if 42 subs (14*3), 22 if 45 subs (15*3)
         si = rand_subs_stre[i]
-        sj = rand_subs_stre[i + Q]
+        sj = rand_subs_stre[i + half] ### used to be i + Q
         xi = np.concatenate([signal[si, :, :, :split], signal[sj, :, :, split:]], axis=2)
         xj = np.concatenate([signal[sj, :, :, :split], signal[si, :, :, split:]], axis=2)
         new_signal1.append(xi)
         new_signal2.append(xj)
     new_signal = new_signal1 + new_signal2
-    new_signal.append(signal[rand_subs_stre[-1]])
+    if num_subs % 2 != 0:
+        new_signal.append(signal[rand_subs_stre[-1]])
     new_signal = np.array(new_signal)
     return new_signal
 
 # Contrast loss function
-def constrast_loss(x, criterion, tau):
+def constrast_loss(x, criterion, tau, is_ok):
     LARGE_NUM = 1e9
     x = F.normalize(x, dim=-1)
     num = int(x.shape[0] / 2)
     hidden1, hidden2 = torch.split(x, num)
     hidden1_large = hidden1
     hidden2_large = hidden2
-    labels = torch.arange(0, num).to('cuda')
-    masks = F.one_hot(torch.arange(0, num), num).to('cuda')
+    labels = torch.arange(0, num, device=device)
+    masks = F.one_hot(torch.arange(0, num), num).to(device)
     logits_aa = torch.matmul(hidden1, hidden1_large.T) / tau
     logits_aa = logits_aa - masks * LARGE_NUM
     logits_bb = torch.matmul(hidden2, hidden2_large.T) / tau
     logits_bb = logits_bb - masks * LARGE_NUM
     logits_ab = torch.matmul(hidden1, hidden2_large.T) / tau
     logits_ba = torch.matmul(hidden2, hidden1_large.T) / tau
-    loss_a = criterion(torch.cat([logits_ab, logits_aa], 1),
-                       labels)
-    loss_b = criterion(torch.cat([logits_ba, logits_bb], 1),
-                       labels)
-    loss = torch.mean(loss_a + loss_b)
+    if is_ok:
+        with torch.autocast(device_type=device.type, dtype=torch.float16):
+            loss_a = criterion(torch.cat([logits_ab, logits_aa], 1),
+                               labels)
+            loss_b = criterion(torch.cat([logits_ba, logits_bb], 1),
+                               labels)
+    else:
+        loss_a = criterion(torch.cat([logits_ab, logits_aa], 1),
+                        labels)
+        loss_b = criterion(torch.cat([logits_ba, logits_bb], 1),
+                        labels)
+    loss = torch.mean(loss_a + loss_b) #TODO: check with division by 2
     return loss, labels, logits_ab
 
 '''Because each subject in the SEED dataset has repeated the experiment on a video
@@ -64,25 +74,27 @@ def constrast_loss(x, criterion, tau):
  EEG signals of the same subject do not appear in each group sample'''
 
 #Test function
-def _eval(model, test_loader, Q, tau):
+def _eval(model, test_loader, Q, tau, is_ok):
+    model.eval()
     iters = 0
     total_acc = 0
     total_loss = 0
     with torch.no_grad():
-        for x, y in test_loader:
+        for x, _ in test_loader:
             iters += 1
             bs, ss = x.shape[0], x.shape[1]
+            half = math.floor(ss / 2)
             rand_subs_stre = random.sample(range(0, ss), ss)
             change = []
             change_sub = []
-            for i in range(0, int((ss - 1) / 2)):
-                if rand_subs_stre[i] // 3 == rand_subs_stre[i + int((ss - 1) / 2)] // 3:
+            for i in range(half): ### used to be int((ss - 1) / 2)
+                if rand_subs_stre[i] // 3 == rand_subs_stre[i + half] // 3:
                     change.append(i)
                     change_sub.append(rand_subs_stre[i])
                 i = i + 1
             if len(change) == 1:
                 if rand_subs_stre[change[0]] // 3 == rand_subs_stre[-1] // 3:
-                    if change[0] == ((ss - 1) / 2) - 1:
+                    if change[0] == half - 1:
                         temp = rand_subs_stre[change[0]]
                         rand_subs_stre[change[0]] = rand_subs_stre[change[0] - 1]
                         rand_subs_stre[change[0] - 1] = temp
@@ -97,7 +109,7 @@ def _eval(model, test_loader, Q, tau):
             elif len(change) >= 1:
                 t = change.pop(0)
                 change.append(t)
-                for c in range(0, len(change)):
+                for c in range(len(change)):
                     rand_subs_stre[change[c]] = change_sub[c]
             split = random.randint(1, 200 - 2)
             x = x.cpu().numpy()
@@ -108,23 +120,29 @@ def _eval(model, test_loader, Q, tau):
             groups = []
             groups_1 = []
             groups_2 = []
-            rand_subs = random.sample(range(ss - 1), 2 * Q)
-            rand_subs1 = rand_subs[:Q]
-            rand_subs2 = rand_subs[Q:]
+            # rand_subs = random.sample(range(ss - 1), 2 * Q)
+            # rand_subs1 = rand_subs[:Q]
+            # rand_subs2 = rand_subs[Q:]
+            rand_subs1 = list(range(0, Q))
+            rand_subs2 = list(range(int(ss / 2), int(ss / 2) + Q))
             for i in range(bs):
                 groups_1.append(x[i, rand_subs1])
             for i in range(bs):
                 groups_2.append(x[i, rand_subs2])
             groups = groups_1 + groups_2
-            groups = np.concatenate(groups)
+            groups = np.concatenate(groups) # [bs*Q*2, 1, channels, sampling points]
             groups = groups.reshape(-1, groups.shape[-3], groups.shape[-2], groups.shape[-1])
             if groups.shape[0] % (2 * Q) != 0:
                 groups = groups[:-2]  ###
-            groups = torch.tensor(groups, dtype=torch.float, device=device)
-            out = model(groups, 'contrast')
-            out = torch.reshape(out, (-1, Q, out.shape[-1]))
-            out = torch.max(out, dim=1)[0]
-            tem_loss, lab_con, logits_ab = constrast_loss(out, criterion, tau)
+            groups = torch.tensor(groups, dtype=torch.float, device=device).to(memory_format=torch.channels_last)
+            if is_ok:
+                with torch.autocast(device_type=device.type, dtype=torch.float16):
+                    out = model(groups, 'contrast') # [bs*Q*2, 4096]
+            else:
+                out = model(groups, 'contrast') # [bs*Q*2, 4096]
+            out = torch.reshape(out, (-1, Q, out.shape[-1])) # [bs*2, Q, 4096]
+            out = torch.max(out, dim=1)[0] # [bs*2, 4096]
+            tem_loss, lab_con, logits_ab = constrast_loss(out, criterion, tau, is_ok)
             _, log_p = torch.max(logits_ab.data, 1)
             loss = tem_loss
             evaluation_batch = ((log_p == lab_con).cpu().numpy() * 1)
@@ -137,26 +155,27 @@ def _eval(model, test_loader, Q, tau):
     return test_acc, test_loss
 
 #Training function
-def _train(model, train_loader, optimizer, epoch, Q, tau):
+def _train(model, train_loader, optimizer, scaler, epoch, Q, tau, is_ok):
     model.train()
-    evaluation = []
+    # evaluation = []
     train_losses = []
     train_acces = []
     iters = 0
-    for x, y in train_loader:
+    for x, _ in train_loader:
         iters += 1
         bs, ss = x.shape[0], x.shape[1]
+        half = math.floor(ss / 2)
         rand_subs_stre = random.sample(range(0, ss), ss)
         change = []
         change_sub = []
-        for i in range(0, int((ss - 1) / 2)):
-            if rand_subs_stre[i] // 3 == rand_subs_stre[i + int((ss - 1) / 2)] // 3:
+        for i in range(half): ### used to be int((ss - 1) / 2)
+            if rand_subs_stre[i] // 3 == rand_subs_stre[i + half] // 3:
                 change.append(i)
                 change_sub.append(rand_subs_stre[i])
             i = i + 1
         if len(change) == 1:
             if rand_subs_stre[change[0]] // 3 == rand_subs_stre[-1] // 3:
-                if change[0] == ((ss - 1) / 2) - 1:
+                if change[0] == half - 1:
                     temp = rand_subs_stre[change[0]]
                     rand_subs_stre[change[0]] = rand_subs_stre[change[0] - 1]
                     rand_subs_stre[change[0] - 1] = temp
@@ -180,10 +199,12 @@ def _train(model, train_loader, optimizer, epoch, Q, tau):
         groups = []
         groups_1 = []
         groups_2 = []
-        rand_subs = random.sample(range(ss - 1), 2 * Q)
-        rand_subs.sort()
-        rand_subs1 = rand_subs[Q:]
-        rand_subs2 = rand_subs[:Q]
+        # rand_subs = random.sample(range(ss - 1), 2 * Q)
+        # rand_subs.sort()
+        # rand_subs1 = rand_subs[Q:]
+        # rand_subs2 = rand_subs[:Q]
+        rand_subs1 = list(range(0,Q))#rand_subs[per:]
+        rand_subs2 = list(range(int(ss/2),int(ss/2)+Q))
         for i in range(bs):
             groups_1.append(x[i, rand_subs1])
         for i in range(bs):
@@ -193,18 +214,23 @@ def _train(model, train_loader, optimizer, epoch, Q, tau):
         groups = groups.reshape(-1, groups.shape[-3], groups.shape[-2], groups.shape[-1])
         if groups.shape[0] % (2 * Q) != 0:
             groups = groups[:-2]  ###
-        groups = torch.tensor(groups, dtype=torch.float, device=device)
-        out = model(groups, 'contrast')
+        groups = torch.tensor(groups, dtype=torch.float, device=device).to(memory_format=torch.channels_last)
+        if is_ok:
+            with torch.autocast(device_type=device.type, dtype=torch.float16):
+                out = model(groups, 'contrast')
+        else:
+            out = model(groups, 'contrast')
         out = torch.reshape(out, (-1, Q, out.shape[-1]))
         out = torch.max(out, dim=1)[0]
-        optimizer.zero_grad()
-        tem_loss, lab_con, logits_ab = constrast_loss(out, criterion, tau)
+        optimizer.zero_grad(set_to_none=True)
+        tem_loss, lab_con, logits_ab = constrast_loss(out, criterion, tau, is_ok)
         _, log_p = torch.max(logits_ab.data, 1)
         loss = tem_loss
         evaluation_batch = ((log_p == lab_con).cpu().numpy() * 1)
-        loss.backward()
+        scaler.scale(loss).backward()
         loss = loss.item()
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         acc = sum(evaluation_batch) / evaluation_batch.shape[0]
         train_losses.append(loss)
         train_acces.append(acc)
@@ -212,38 +238,40 @@ def _train(model, train_loader, optimizer, epoch, Q, tau):
     return train_acces, train_losses
 
 #SSL training function
-def _train_epochs(model, train_loader, test_loader, epochs, Q, tau):
+def _train_epochs(model, train_loader, test_loader, epochs, Q, tau, is_ok):
     optimizer = optim.Adam(model.parameters(), lr)
-    print('开始预训练')
-    test_acc, test_loss = _eval(model, test_loader, Q, tau)
+    scaler = torch.cuda.amp.GradScaler(enabled=is_ok)
+    print('Start pre-training')
+    test_acc, test_loss = _eval(model, test_loader, Q, tau, is_ok)
     print(f'Epoch: {0}, Train_loss: {test_loss:.4f}, Test_acc: {test_acc:.4f}')
     test_acces = [test_acc]
     test_losses = [test_loss]
     train_acces = []
     train_losses = []
     for epoch in range(1, epochs + 1):
-        train_acces_tem, train_losses_tem = _train(model, train_loader, optimizer, epoch, Q, tau)
-        if epoch % 1 == 0:
+        train_acces_tem, train_losses_tem = _train(model, train_loader, optimizer, scaler, epoch, Q, tau, is_ok)
+        if epoch % 20 == 0 or epoch == epochs:
             torch.save(model,
                        os.path.join(saved_models_dir, saved_models_dir + ';epoch={}.pth'.format(str(epoch).zfill(3))))
         train_acces.extend(train_acces_tem)
         train_losses.extend(train_losses_tem)
-        # 每个epoch测试一次
-        test_acc, test_loss = _eval(model, test_loader, Q, tau)
+        # Tested once per epoch
+        test_acc, test_loss = _eval(model, test_loader, Q, tau, is_ok)
         test_losses.append(test_loss)
         test_acces.append(test_acc)
-        print(f'Epoch: {epoch}, Train_loss: {test_loss:.4f}, Test_acc: {test_acc:.4f}')
+        print(f'Epoch: {epoch}, Test_loss: {test_loss:.4f}, Test_acc: {test_acc:.4f}')
     return test_acces, test_losses, train_acces, train_losses
 
 
-import numpy as np
-
-device = "cuda"
 #Import data and set hyper-parameter
-x_train_path = 'x_train_SEED.npy'
-x_test_path = 'x_test_SEED.npy'
-y_train_path = 'y_train_SEED.npy'
-y_test_path = 'y_test_SEED.npy'
+x_train_path = 'x_train_SEED_ind(1).npy'
+x_test_path = 'x_test_SEED_ind(1).npy'
+y_train_path = 'y_train_SEED_ind(1).npy'
+y_test_path = 'y_test_SEED_ind(1).npy'
+# x_train_path = 'x_train_SEED.npy'
+# x_test_path = 'x_test_SEED.npy'
+# y_train_path = 'y_train_SEED.npy'
+# y_test_path = 'y_test_SEED.npy'
 
 x_train = np.load(x_train_path)
 x_test = np.load(x_test_path)
@@ -256,12 +284,12 @@ y_train = torch.tensor(y_train, dtype=torch.long)
 y_test = torch.tensor(y_test, dtype=torch.long)
 print(x_train.shape)
 
-model = ResNet()
-model = nn.DataParallel(model)
+model = ResNet(num_classes=3)
+model = nn.DataParallel(model).to(device=device, memory_format=torch.channels_last)
 criterion = nn.CrossEntropyLoss().to(device)
 import torch.optim as optim
 
-epochs = 4000
+epochs = 3288
 tau = 0.1
 P = 16
 Q = 2
@@ -278,16 +306,18 @@ if not os.path.exists(ssl_logs):
 
 
 train_dataset = data.TensorDataset(x_train, y_train)
-train_loader = data.DataLoader(train_dataset, P, shuffle=True)
+train_loader = data.DataLoader(train_dataset, P, shuffle=True, pin_memory=True)
 test_dataset = data.TensorDataset(x_test, y_test)
-test_loader = data.DataLoader(test_dataset, P, shuffle=True)
+test_loader = data.DataLoader(test_dataset, P, shuffle=True, pin_memory=True)
 
+torch.backends.cudnn.benchmark = True
 test_acces, test_losses, train_acces, train_losses = _train_epochs(model,
                                                                    train_loader,
                                                                    test_loader,
                                                                    epochs,
                                                                    Q,
-                                                                   tau)
+                                                                   tau,
+                                                                   is_ok)
 
 import pandas as pd
 

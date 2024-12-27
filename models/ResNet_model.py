@@ -256,7 +256,7 @@ class ResNet(nn.Module):
         self.fc_classifier3 = nn.Linear(128 * self.block.expansion, num_classes)
         self.bn_fc_p1 = nn.BatchNorm1d(1024 * self.block.expansion)
         self.fc_projector1 = nn.Linear(512 * self.block.expansion, 1024 * self.block.expansion)
-        self.bn_fc_p1 = nn.BatchNorm1d(1024)
+        # self.bn_fc_p1 = nn.BatchNorm1d(1024)
         self.fc_projector2 = nn.Linear(1024 * self.block.expansion, 2048 * self.block.expansion)
         self.bn_fc_p2 = nn.BatchNorm1d(2048 * self.block.expansion)
 

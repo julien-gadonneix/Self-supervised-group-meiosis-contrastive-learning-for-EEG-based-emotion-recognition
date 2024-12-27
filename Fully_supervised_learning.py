@@ -9,7 +9,7 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
-from ResNet_model import ResNet
+from models.ResNet_model import ResNet
 import pandas as pd
 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 import warnings

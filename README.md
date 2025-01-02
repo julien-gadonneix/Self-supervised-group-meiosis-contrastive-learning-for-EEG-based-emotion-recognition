@@ -2,7 +2,9 @@ There is a self-supervised learning framework to realize EEG-based emotion class
 Article title： Self-supervised Group Meiosis Contrastive Learning for EEG-Based Emotion Recognition
 Article link： https://arxiv.org/abs/2208.00877
 
-##
+#
+
+# Improvements
 
 This is a fork from the original [repository](https://github.com/kanhaoning/Self-supervised-group-meiosis-contrastive-learning-for-EEG-based-emotion-recognition).
 
